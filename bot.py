@@ -1,6 +1,7 @@
 """
-Telegram Bot：输入 X (Twitter) 帖子链接，按类型返回视频 / 图片 / 文字。
-数据来源：FxTwitter 公开 API（无需 X 官方开发者账号）。
+Telegram Bot：
+1) X 帖子链接 → 下载视频 / 图片 / 文字
+2) 普通文字 → DeepSeek 对话
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 
 import httpx
@@ -41,6 +43,8 @@ STATUS_ID_RE = re.compile(
 )
 
 FX_API = "https://api.fxtwitter.com/2/status/{status_id}"
+DEEPSEEK_API = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip() or "deepseek-chat"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -48,8 +52,19 @@ USER_AGENT = (
 )
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
-MAX_VIDEO_BYTES = 49 * 1024 * 1024  # 留一点余量，避免卡在 50MB 边界
+MAX_VIDEO_BYTES = 49 * 1024 * 1024
 MAX_CAPTION = 1024
+TELEGRAM_TEXT_LIMIT = 4000
+MAX_HISTORY_TURNS = 20  # 每边各算，总条约 40 条消息
+
+SYSTEM_PROMPT = (
+    "你是一个友好、简洁的中文助手，运行在 Telegram Bot 里。"
+    "回答清楚即可，不要过度啰嗦。用户如果发来 X/Twitter 链接，系统会单独处理下载，"
+    "你这边主要负责普通聊天、解释和问答。"
+)
+
+# chat_id -> [{"role": "...", "content": "..."}, ...]
+chat_histories: dict[int, list[dict[str, str]]] = defaultdict(list)
 
 
 def extract_status_id(text: str) -> str | None:
@@ -62,6 +77,17 @@ def truncate(text: str, limit: int = MAX_CAPTION) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    text = text.strip() or "（空回复）"
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        chunks.append(text[:limit])
+        text = text[limit:]
+    return chunks
 
 
 async def fetch_post(status_id: str) -> dict:
@@ -80,7 +106,6 @@ async def fetch_post(status_id: str) -> dict:
 
 
 def list_mp4_formats(video: dict) -> list[dict]:
-    """收集可用 mp4 清晰度，按码率从高到低排序。"""
     formats = video.get("formats") or []
     mp4s = [
         f
@@ -92,13 +117,18 @@ def list_mp4_formats(video: dict) -> list[dict]:
         )
     ]
     if not mp4s and video.get("url"):
-        mp4s = [{"url": video["url"], "bitrate": video.get("bitrate") or 0, "filesize": video.get("filesize")}]
+        mp4s = [
+            {
+                "url": video["url"],
+                "bitrate": video.get("bitrate") or 0,
+                "filesize": video.get("filesize"),
+            }
+        ]
     mp4s.sort(key=lambda f: f.get("bitrate") or 0, reverse=True)
     return mp4s
 
 
 def collect_media(status: dict) -> tuple[list[str], list[dict]]:
-    """返回 (photo_urls, video_objects)。"""
     media = status.get("media") or {}
     photos: list[str] = []
     videos: list[dict] = []
@@ -148,7 +178,6 @@ async def download_file(url: str, suffix: str) -> Path:
 
 
 def compress_video(src: Path, max_bytes: int = MAX_VIDEO_BYTES) -> Path | None:
-    """若本机有 ffmpeg，压缩到接近 Telegram 限制。"""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
@@ -156,7 +185,6 @@ def compress_video(src: Path, max_bytes: int = MAX_VIDEO_BYTES) -> Path | None:
     fd, out = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     out_path = Path(out)
-    # 目标约 45MB，码率按 2 分钟粗略估算；再不行逐步降
     for crf in (28, 32, 36):
         try:
             subprocess.run(
@@ -198,15 +226,10 @@ async def download_video_under_limit(
     video: dict,
     temp_files: list[Path],
 ) -> tuple[Path | None, str | None, str]:
-    """
-    依次尝试从高到低清晰度，找到不超过限制的文件。
-    返回 (本地路径, 所用直链, 说明信息)。
-    """
     formats = list_mp4_formats(video)
     if not formats:
         return None, None, "没有可用视频地址"
 
-    # 若 API 提供 filesize，优先跳过明显超限的
     candidates = []
     for fmt in formats:
         size = fmt.get("filesize")
@@ -214,7 +237,7 @@ async def download_video_under_limit(
             continue
         candidates.append(fmt)
     if not candidates:
-        candidates = list(formats)  # 全超限也仍尝试下载，后面再压缩
+        candidates = list(formats)
 
     last_url = candidates[0]["url"]
     last_path: Path | None = None
@@ -227,13 +250,11 @@ async def download_video_under_limit(
         size = path.stat().st_size
         if size <= MAX_VIDEO_BYTES:
             note = ""
-            # 若不是最高清，提示一下
             if formats and url != formats[0]["url"]:
                 note = f"已自动选用较小清晰度（{size / 1024 / 1024:.1f} MB）"
             return path, url, note
         last_path = path
 
-    # 全部超限：尝试 ffmpeg 压缩最大的那个（通常画质最好）
     if last_path is not None:
         compressed = compress_video(last_path)
         if compressed is not None:
@@ -248,15 +269,60 @@ async def download_video_under_limit(
     )
 
 
+async def ask_deepseek(chat_id: int, user_text: str) -> str:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        return (
+            "还没配置 DeepSeek。请在服务器 .env 里加入：\n"
+            "DEEPSEEK_API_KEY=你的密钥\n"
+            "然后执行：systemctl restart x-telegram-bot"
+        )
+
+    history = chat_histories[chat_id]
+    history.append({"role": "user", "content": user_text})
+    # 只保留最近若干轮
+    if len(history) > MAX_HISTORY_TURNS * 2:
+        chat_histories[chat_id] = history[-MAX_HISTORY_TURNS * 2 :]
+        history = chat_histories[chat_id]
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(
+            DEEPSEEK_API,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": DEEPSEEK_MODEL,
+                "messages": messages,
+                "temperature": 0.7,
+                "stream": False,
+            },
+        )
+        if resp.status_code >= 400:
+            detail = resp.text[:500]
+            raise RuntimeError(f"DeepSeek HTTP {resp.status_code}: {detail}")
+        data = resp.json()
+
+    try:
+        answer = data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError(f"DeepSeek 返回格式异常: {data}") from exc
+
+    history.append({"role": "assistant", "content": answer})
+    return answer
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "把 X / Twitter 帖子链接发给我即可。\n\n"
-        "支持：\n"
-        "• 视频帖 → 下载视频发回（过大时自动换小清晰度/压缩）\n"
-        "• 图片帖 → 下载图片发回\n"
-        "• 纯文字 → 直接返回文字\n\n"
-        "示例：\n"
-        "https://x.com/user/status/1234567890"
+        "你好！我可以：\n\n"
+        "1) 直接跟我聊天（DeepSeek）\n"
+        "2) 发 X / Twitter 帖子链接 → 下载视频 / 图片 / 文字\n\n"
+        "命令：\n"
+        "/clear — 清空当前对话记忆\n"
+        "/help — 查看说明"
     )
 
 
@@ -264,19 +330,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
-        return
+async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id is not None:
+        chat_histories.pop(chat_id, None)
+    await update.message.reply_text("已清空对话记忆，可以重新开始聊。")
 
-    status_id = extract_status_id(message.text)
-    if not status_id:
-        await message.reply_text(
-            "未识别到有效的 X 帖子链接。\n"
-            "请发送类似：https://x.com/用户名/status/数字ID"
-        )
-        return
 
+async def handle_x_link(message, context: ContextTypes.DEFAULT_TYPE, status_id: str) -> None:
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     status_msg = await message.reply_text("正在解析帖子…")
 
@@ -286,7 +347,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         photos, videos = collect_media(status)
         caption = build_caption(status)
 
-        # 1) 视频
         if videos:
             await status_msg.edit_text("检测到视频，正在选择合适清晰度并下载…")
             await context.bot.send_chat_action(
@@ -315,7 +375,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_msg.delete()
             return
 
-        # 2) 图片
         if photos:
             await status_msg.edit_text(f"检测到 {len(photos)} 张图片，正在下载…")
             await context.bot.send_chat_action(
@@ -360,7 +419,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await status_msg.delete()
             return
 
-        # 3) 纯文字
         await status_msg.edit_text(caption, disable_web_page_preview=True)
 
     except httpx.HTTPStatusError as exc:
@@ -377,6 +435,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
 
 
+async def handle_chat(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    try:
+        answer = await ask_deepseek(message.chat_id, message.text.strip())
+        for chunk in split_telegram_text(answer):
+            await message.reply_text(chunk)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("DeepSeek 对话失败")
+        await message.reply_text(f"聊天失败：{exc}")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    status_id = extract_status_id(message.text)
+    if status_id:
+        await handle_x_link(message, context, status_id)
+    else:
+        await handle_chat(message, context)
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -385,9 +466,13 @@ def main() -> None:
             "请复制 .env.example 为 .env，填入 BotFather 发给你的 Token。"
         )
 
+    if not os.getenv("DEEPSEEK_API_KEY", "").strip():
+        logger.warning("未设置 DEEPSEEK_API_KEY，聊天功能不可用，X 下载仍可用")
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已启动，按 Ctrl+C 停止")
