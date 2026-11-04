@@ -58,9 +58,10 @@ TELEGRAM_TEXT_LIMIT = 4000
 MAX_HISTORY_TURNS = 20  # 每边各算，总条约 40 条消息
 
 SYSTEM_PROMPT = (
-    "你是一个友好、简洁的中文助手，运行在 Telegram Bot 里。"
-    "回答清楚即可，不要过度啰嗦。用户如果发来 X/Twitter 链接，系统会单独处理下载，"
-    "你这边主要负责普通聊天、解释和问答。"
+    "你是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
+    "自我介绍时请说：我是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
+    "回答友好、简洁，不要过度啰嗦。"
+    "用户如果发来 X/Twitter 链接，系统会单独处理下载，你主要负责普通聊天与问答。"
 )
 
 # chat_id -> [{"role": "...", "content": "..."}, ...]
@@ -269,8 +270,55 @@ async def download_video_under_limit(
     )
 
 
+def get_deepseek_api_key() -> str:
+    return os.getenv("DEEPSEEK_API_KEY", "").strip()
+
+
+async def fetch_deepseek_balance() -> str:
+    api_key = get_deepseek_api_key()
+    if not api_key:
+        return (
+            "还没配置 DEEPSEEK_API_KEY。\n"
+            "请在服务器 .env 写入后执行：systemctl restart x-telegram-bot"
+        )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            "https://api.deepseek.com/user/balance",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"查询失败 HTTP {resp.status_code}: {resp.text[:300]}")
+        data = resp.json()
+
+    available = data.get("is_available")
+    status = "可用" if available else "不足/不可用"
+    lines = [f"DeepSeek 账户状态：{status}", ""]
+
+    infos = data.get("balance_infos") or []
+    if not infos:
+        lines.append("未返回余额明细。")
+        return "\n".join(lines)
+
+    for info in infos:
+        currency = info.get("currency") or "?"
+        total = info.get("total_balance") or "0"
+        granted = info.get("granted_balance") or "0"
+        topped = info.get("topped_up_balance") or "0"
+        lines.append(f"币种：{currency}")
+        lines.append(f"• 总余额：{total}")
+        lines.append(f"• 赠送余额：{granted}")
+        lines.append(f"• 充值余额：{topped}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 async def ask_deepseek(chat_id: int, user_text: str) -> str:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    api_key = get_deepseek_api_key()
     if not api_key:
         return (
             "还没配置 DeepSeek。请在服务器 .env 里加入：\n"
@@ -317,10 +365,12 @@ async def ask_deepseek(chat_id: int, user_text: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "你好！我可以：\n\n"
-        "1) 直接跟我聊天（DeepSeek）\n"
+        "我是 Alfred 的聊天 Bot，由 DeepSeek 驱动。\n\n"
+        "我可以：\n"
+        "1) 直接跟我聊天\n"
         "2) 发 X / Twitter 帖子链接 → 下载视频 / 图片 / 文字\n\n"
         "命令：\n"
+        "/balance — 查询 DeepSeek API 余额\n"
         "/clear — 清空当前对话记忆\n"
         "/help — 查看说明"
     )
@@ -335,6 +385,18 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat_id is not None:
         chat_histories.pop(chat_id, None)
     await update.message.reply_text("已清空对话记忆，可以重新开始聊。")
+
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
+    )
+    try:
+        text = await fetch_deepseek_balance()
+        await update.message.reply_text(text)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("查询 DeepSeek 余额失败")
+        await update.message.reply_text(f"查询余额失败：{exc}")
 
 
 async def handle_x_link(message, context: ContextTypes.DEFAULT_TYPE, status_id: str) -> None:
@@ -473,6 +535,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
+    app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已启动，按 Ctrl+C 停止")
