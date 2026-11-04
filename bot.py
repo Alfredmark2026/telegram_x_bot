@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import InputMediaPhoto, Update
+from telegram import BotCommand, InputMediaPhoto, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -26,6 +26,22 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+BOT_COMMANDS = [
+    BotCommand("start", "开始使用 / 查看功能说明"),
+    BotCommand("help", "查看帮助与命令列表"),
+    BotCommand("chat", "切换到聊天模式"),
+    BotCommand("translate", "切换到翻译模式（先回复 OK）"),
+    BotCommand("mode", "查看或切换当前模式"),
+    BotCommand("balance", "查询 DeepSeek API 余额"),
+    BotCommand("clear", "清空当前对话记忆"),
+]
+
+
+async def setup_bot_commands(app: Application) -> None:
+    await app.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("已注册 Telegram 命令菜单（输入 / 可查看）")
+
 
 load_dotenv()
 
@@ -638,7 +654,12 @@ def main() -> None:
     if not os.getenv("DEEPSEEK_API_KEY", "").strip():
         logger.warning("未设置 DEEPSEEK_API_KEY，聊天功能不可用，X 下载仍可用")
 
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(setup_bot_commands)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
