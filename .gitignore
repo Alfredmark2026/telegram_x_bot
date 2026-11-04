@@ -1,0 +1,10 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+bot.pid
+bot.log
+*.mp4
+*.jpg
+*.png
+.DS_Store
