@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import BotCommand, InputMediaPhoto, Update
+from telegram import BotCommand, InputMediaPhoto, MenuButtonCommands, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -39,8 +39,11 @@ BOT_COMMANDS = [
 
 
 async def setup_bot_commands(app: Application) -> None:
+    # 注册斜杠命令列表（点 Menu 或输入 / 都会看到）
     await app.bot.set_my_commands(BOT_COMMANDS)
-    logger.info("已注册 Telegram 命令菜单（输入 / 可查看）")
+    # 输入框左侧显示 Menu 按钮，点开就是命令列表
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    logger.info("已注册 Telegram Menu 命令菜单")
 
 
 load_dotenv()
