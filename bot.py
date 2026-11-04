@@ -57,15 +57,58 @@ MAX_CAPTION = 1024
 TELEGRAM_TEXT_LIMIT = 4000
 MAX_HISTORY_TURNS = 20  # 每边各算，总条约 40 条消息
 
-SYSTEM_PROMPT = (
-    "你是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
-    "自我介绍时请说：我是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
-    "回答友好、简洁，不要过度啰嗦。"
-    "用户如果发来 X/Twitter 链接，系统会单独处理下载，你主要负责普通聊天与问答。"
-)
+MODE_CHAT = "chat"
+MODE_TRANSLATE = "translate"
+
+MODE_PROMPTS = {
+    MODE_CHAT: (
+        "你是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
+        "自我介绍时请说：我是 Alfred 的聊天 Bot，由 DeepSeek 驱动。"
+        "回答友好、简洁，不要过度啰嗦。"
+        "用户如果发来 X/Twitter 链接，系统会单独处理下载，你主要负责普通聊天与问答。"
+    ),
+    MODE_TRANSLATE: (
+        "假设你是一位精通中英互译的专业人士，对于翻译有深入的理解。"
+        "请将用户发来的英文／中文段落翻译成英文／中文。\n\n"
+        "规则：\n"
+        "- 翻译时要准确传达英文／中文对话事实和背景。\n"
+        "- 分成两次翻译，并且回答每一次结果：\n"
+        "第一次结果要根据英文／中文内容直译，不要遗漏任何信息；\n"
+        "第二次结果要根据第一次直译的结果重新意译，遵守原意的前提下让内容更通俗易懂，"
+        "符合英文／中文表达习惯。\n\n"
+        "输出格式必须严格如下（不要额外寒暄）：\n"
+        "【直译】\n"
+        "...\n\n"
+        "【意译】\n"
+        "...\n\n"
+        "判断方向：中文原文→译成英文；英文原文→译成中文；其他语言→译成中文并在末尾注明语种。"
+        "专有名词、代码、链接尽量保留原文。"
+    ),
+}
+
+MODE_LABELS = {
+    MODE_CHAT: "聊天模式",
+    MODE_TRANSLATE: "翻译模式",
+}
 
 # chat_id -> [{"role": "...", "content": "..."}, ...]
 chat_histories: dict[int, list[dict[str, str]]] = defaultdict(list)
+# chat_id -> mode name
+chat_modes: dict[int, str] = defaultdict(lambda: MODE_CHAT)
+
+
+def get_mode(chat_id: int) -> str:
+    mode = chat_modes.get(chat_id, MODE_CHAT)
+    return mode if mode in MODE_PROMPTS else MODE_CHAT
+
+
+def set_mode(chat_id: int, mode: str) -> str:
+    if mode not in MODE_PROMPTS:
+        raise ValueError(f"未知模式：{mode}")
+    chat_modes[chat_id] = mode
+    # 切换人设时清空旧对话，避免串戏
+    chat_histories.pop(chat_id, None)
+    return mode
 
 
 def extract_status_id(text: str) -> str | None:
@@ -333,7 +376,10 @@ async def ask_deepseek(chat_id: int, user_text: str) -> str:
         chat_histories[chat_id] = history[-MAX_HISTORY_TURNS * 2 :]
         history = chat_histories[chat_id]
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+    mode = get_mode(chat_id)
+    system_prompt = MODE_PROMPTS[mode]
+    temperature = 0.2 if mode == MODE_TRANSLATE else 0.7
+    messages = [{"role": "system", "content": system_prompt}, *history]
 
     async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(
@@ -345,7 +391,7 @@ async def ask_deepseek(chat_id: int, user_text: str) -> str:
             json={
                 "model": DEEPSEEK_MODEL,
                 "messages": messages,
-                "temperature": 0.7,
+                "temperature": temperature,
                 "stream": False,
             },
         )
@@ -364,12 +410,18 @@ async def ask_deepseek(chat_id: int, user_text: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    mode = get_mode(chat_id)
     await update.message.reply_text(
         "我是 Alfred 的聊天 Bot，由 DeepSeek 驱动。\n\n"
+        f"当前模式：{MODE_LABELS[mode]}\n\n"
         "我可以：\n"
-        "1) 直接跟我聊天\n"
+        "1) 聊天 / 翻译（可切换人设）\n"
         "2) 发 X / Twitter 帖子链接 → 下载视频 / 图片 / 文字\n\n"
         "命令：\n"
+        "/translate — 切换到翻译模式\n"
+        "/chat — 切换到聊天模式\n"
+        "/mode — 查看或切换模式\n"
         "/balance — 查询 DeepSeek API 余额\n"
         "/clear — 清空当前对话记忆\n"
         "/help — 查看说明"
@@ -397,6 +449,61 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:  # noqa: BLE001
         logger.exception("查询 DeepSeek 余额失败")
         await update.message.reply_text(f"查询余额失败：{exc}")
+
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    args = context.args or []
+
+    if not args:
+        mode = get_mode(chat_id)
+        await update.message.reply_text(
+            f"当前模式：{MODE_LABELS[mode]}\n\n"
+            "切换方式：\n"
+            "/translate — 翻译模式\n"
+            "/chat — 聊天模式\n"
+            "/mode translate\n"
+            "/mode chat"
+        )
+        return
+
+    raw = args[0].strip().lower()
+    alias = {
+        "translate": MODE_TRANSLATE,
+        "translation": MODE_TRANSLATE,
+        "翻译": MODE_TRANSLATE,
+        "chat": MODE_CHAT,
+        "聊天": MODE_CHAT,
+    }
+    mode = alias.get(raw)
+    if not mode:
+        await update.message.reply_text("未知模式。可用：translate / chat")
+        return
+
+    set_mode(chat_id, mode)
+    if mode == MODE_TRANSLATE:
+        await update.message.reply_text("OK")
+    else:
+        await update.message.reply_text(
+            "已切换到聊天模式。可以正常对话了。\n"
+            "（切换模式时已清空旧对话记忆）"
+        )
+
+
+async def translate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    set_mode(chat_id, MODE_TRANSLATE)
+    # 对齐你的提示词约定：进入翻译模式后先回复 OK，等待下一条正文
+    await update.message.reply_text("OK")
+
+
+async def chat_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    set_mode(chat_id, MODE_CHAT)
+    await update.message.reply_text(
+        "已切换到聊天模式。可以正常对话了。\n"
+        "（切换模式时已清空旧对话记忆）"
+    )
 
 
 async def handle_x_link(message, context: ContextTypes.DEFAULT_TYPE, status_id: str) -> None:
@@ -536,6 +643,9 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("translate", translate_cmd))
+    app.add_handler(CommandHandler("chat", chat_mode_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot 已启动，按 Ctrl+C 停止")
